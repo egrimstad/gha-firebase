@@ -17,9 +17,18 @@ on:
         type: string
         description: "Entry point folder to deploy"
         default: "."
+      node-version:
+        type: string
+        description: "Node version to use"
+      node-version-file:
+        type: string
+        description: "Where to read node version from. Relative to entry_point directory."
+      package-manager:
+        type: string
+        description: "Which node package manager the project uses. npm/yarn/pnpm"
       tools_version:
         type: string
-        description: "Optional Firebase-tools version to use when deploying"
+        description: "Optional Firebase-tools version to use when deploying. If package-manager is set, the version declared in package.json will be used instead."
         default: "15.18.0"
       target:
         type: string
@@ -54,6 +63,8 @@ on:
         value: ${{ jobs.deploy_preview.outputs.details_url }}
       urls:
         value: ${{ jobs.deploy_preview.outputs.urls }}
+      firebase_tools_version:
+        value: ${{ jobs.deploy_preview.outputs.firebase_tools_version }}
 
 jobs:
   deploy_preview:
@@ -67,6 +78,7 @@ jobs:
     outputs:
       details_url: ${{ steps.firebase-deploy-preview.outputs.details_url }}
       urls: ${{ steps.firebase-deploy-preview.outputs.urls }}
+      firebase_tools_version: ${{ steps.find-firebase-tools-version.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,7 +88,50 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24.22.1
+          node-version: |-
+            ${{ case(
+              inputs.node-version != '', inputs.node_version,
+              inputs.node-version-file != '', '',
+              '24.22.1'
+            )}}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: ${{ inputs.package-manager }}
+
+      - name: Install packages
+        if: ${{ inputs.package-manager != '' }}
+        working-directory: ${{ inputs.entry_point }}
+        run: |-
+          ${{ case(
+            inputs.package-manager == 'yarn', 'yarn install --immutable',
+            inputs.package-manager == 'npm', 'npm ci',
+            inputs.package-manager == 'pnpm', 'pnpm install',
+            'exit'
+          )}}
+      - name: Find firebase-tools version
+        id: find-firebase-tools-version
+        env:
+          GHA_FIREBASE_TOOLS_VERSION: ${{ inputs.tools_version }}
+          GHA_FIREBASE_PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        working-directory: ${{ inputs.entry_point }}
+        shell: bash
+        run: |
+          version=$GHA_FIREBASE_TOOLS_VERSION
+          
+          case "$GHA_FIREBASE_PACKAGE_MANAGER" in
+            "yarn")
+              version=$(yarn info firebase-tools --json | jq -r ".children.Version")
+              ;;
+            "npm")
+              version=$(npm info firebase-tools version)
+              ;;
+            "pnpm")
+              version=$(pnpm info firebase-tools version)
+              ;;
+          esac
+          
+          echo "Found firebase-tools version: $version"
+          
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate with GCP
         id: auth
@@ -123,7 +178,7 @@ jobs:
           NPM_CONFIG_MIN_RELEASE_AGE: 4
           PROJECT_ID: ${{ inputs.gcp_project_id }}
           SITE_ID: ${{ inputs.site_id || inputs.gcp_project_id }}
-          TOOLS_VERSION: ${{ inputs.tools_version }}
+          TOOLS_VERSION: ${{ steps.find-firebase-tools-version.outputs.version }}
         run: |
           # A failing list stops the step with the real error instead of being mistaken for a missing site.
           SITES=$(npx --yes "firebase-tools@${TOOLS_VERSION}" hosting:sites:list --project "${PROJECT_ID}" --json)
@@ -135,7 +190,7 @@ jobs:
 
       - name: Firebase deploy preview
         id: firebase-deploy-preview
-        uses: FirebaseExtended/action-hosting-deploy@500ac625ca2dd40cbd15f7659af953801858032a # v0.10.0 + node24 runtime (PR #450)
+        uses: FirebaseExtended/action-hosting-deploy@500ac625ca2dd40cbd15f7659af953801858032a # v0.11.0
         env:
           NPM_CONFIG_IGNORE_SCRIPTS: true
           NPM_CONFIG_MIN_RELEASE_AGE: 4
@@ -143,7 +198,7 @@ jobs:
           firebaseServiceAccount: "${{ env.SERVICE_ACCOUNT_KEY }}"
           projectId: ${{ inputs.gcp_project_id }}
           entryPoint: ${{ inputs.entry_point }}
-          firebaseToolsVersion: ${{ inputs.tools_version }}
+          firebaseToolsVersion: ${{ steps.find-firebase-tools-version.outputs.version }}
           target: ${{ inputs.target }}
           channelId: ${{ env.CHANNEL_ID }}
           expires: ${{ inputs.preview_expire }}
